@@ -23,7 +23,23 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
+type JobRequest struct {
+	AssignedTask Task
+}
 
+
+type JobReply struct {
+	AssignedTask Task
+	NumberOfReduce int
+	NumberOfFiles int
+	RequestIsCompleted bool
+}
+
+type JobFinish struct {
+	JobId int
+	IntermediateFile string
+	JobType int
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the master.

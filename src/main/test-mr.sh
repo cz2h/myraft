@@ -157,6 +157,7 @@ wait ; wait
 sort mr-out-0 > mr-correct-crash.txt
 rm -f mr-out*
 
+# TODO PASS THIS CRASH TEST
 echo '***' Starting crash test.
 
 rm -f mr-done
