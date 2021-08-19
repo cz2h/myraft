@@ -256,13 +256,14 @@ func (cfg *config) connect(i int) {
 
 // detach server i from the net.
 func (cfg *config) disconnect(i int) {
-	// fmt.Printf("disconnect(%d)\n", i)
+	log.Printf("disconnect(%d)\n", i)
 
 	cfg.connected[i] = false
 
 	// outgoing ClientEnds
 	for j := 0; j < cfg.n; j++ {
 		if cfg.endnames[i] != nil {
+			log.Printf("disconnect %d outgoing end\n", i)
 			endname := cfg.endnames[i][j]
 			cfg.net.Enable(endname, false)
 		}
@@ -271,6 +272,7 @@ func (cfg *config) disconnect(i int) {
 	// incoming ClientEnds
 	for j := 0; j < cfg.n; j++ {
 		if cfg.endnames[j] != nil {
+			log.Printf("disconnect %d incoming end\n", i)
 			endname := cfg.endnames[j][i]
 			cfg.net.Enable(endname, false)
 		}
@@ -300,6 +302,7 @@ func (cfg *config) setlongreordering(longrel bool) {
 // check that there's exactly one leader.
 // try a few times in case re-elections are needed.
 func (cfg *config) checkOneLeader() int {
+	fmt.Println("In check one leader")
 	for iters := 0; iters < 10; iters++ {
 		ms := 450 + (rand.Int63() % 100)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
@@ -317,6 +320,8 @@ func (cfg *config) checkOneLeader() int {
 		for term, leaders := range leaders {
 			if len(leaders) > 1 {
 				cfg.t.Fatalf("term %d has %d (>1) leaders", term, len(leaders))
+			} else {
+				log.Printf("term %d has %d leader called %d\n", term, len(leaders), leaders[0])
 			}
 			if term > lastTermWithLeader {
 				lastTermWithLeader = term

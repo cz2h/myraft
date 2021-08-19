@@ -21,10 +21,20 @@ import "sync"
 import "sync/atomic"
 import "../labrpc"
 
+import "log"
+import "math/rand"
+import "time"
 // import "bytes"
 // import "../labgob"
 
 
+// Role of raft instance
+const (
+	NotAssigned int = -1
+	Follower int = 0
+	Candidate int = 1
+	Leader int = 2
+)
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -43,9 +53,7 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
-//
-// A Go object implementing a single Raft peer.
-//
+// Role of a raft server, can only be one of three.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
@@ -56,17 +64,54 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	role int // role of this raft server.
+	currentTerm int // term used for proposing a election.
+	votedFor int // candidateId that received vote in current term.
+	logs []LogEntry // log entries, each entry contains command and term when it was received.
+	raftTimer *RaftTime
+
+	// volatile state on all servers.
+	commitIndex int // index of highest log entry
+	lastApplied int // index of highest log entry applied to state machine.
+
+	// volatile state on leaders.
+
+
+	// Variables for leader election.
+	// vote counts.
+	voteCounts int
+	electionTimeoutMillSec int
+
 
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	var term int = rf.currentTerm;
+	var isleader bool = rf.role == Leader
 	// Your code here (2A).
+	if isleader {
+		log.Printf("%d is leader with term %d!\n", rf.me, rf.currentTerm)
+	} else {
+		log.Printf("%d is now %d\n", rf.me, rf.role)
+	}
 	return term, isleader
+}
+
+func (rf *Raft) ChangeRoleTo(role int) {
+	log.Printf("%d %d -> %d with term %d", rf.me, rf.role, role, rf.currentTerm)
+	rf.role = role
+}
+
+func (rf *Raft) SetTermTo(term int) {
+	rf.currentTerm = term
+}
+
+func (rf *Raft) VoteCountIncrBy(num int) {
+	rf.voteCounts += num
 }
 
 //
@@ -110,69 +155,20 @@ func (rf *Raft) readPersist(data []byte) {
 
 
 
-
-//
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-//
-type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
+type HeartBeatArgs struct {
+	Term int // term of the Leader
 }
 
-//
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
-type RequestVoteReply struct {
-	// Your data here (2A).
-}
-
-//
-// example RequestVote RPC handler.
-//
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
-}
-
-//
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-//
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
+type HeartBeatRes struct {
+	Term int // term from the response
+	Success bool
 }
 
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
-// server isn't the leader, returns false. otherwise start the
+// server isn't the leader, returns false. otherwise start thera
 // agreement and return immediately. there is no guarantee that this
 // command will ever be committed to the Raft log, since the leader
 // may fail or lose an election. even if the Raft instance has been killed,
@@ -184,9 +180,9 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	index := rf.commitIndex
+	term := rf.currentTerm
+	isLeader := rf.role == Leader
 
 	// Your code here (2B).
 
@@ -215,6 +211,139 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+// Follower related functions
+// State change for followers.
+func (rf *Raft) ChangeToFollower() {
+	if rf.role == Follower {
+		return
+	}
+	rf.ChangeRoleTo(Follower)
+	rf.votedFor = -1
+	rf.raftTimer.SetHeartBeatTo(false)
+	// Start a electionTimeout trigger.
+	go rf.FollowerWaitTimeOut()
+}
+
+// Follower wait for timeout.
+func (rf *Raft) FollowerWaitTimeOut() {
+	rf.raftTimer.SetHeartBeatTo(false) // initialize.
+	for rf.role == Follower{
+		// sleep
+		log.Printf("%d sleep for heartbeat \n", rf.me)
+		rf.raftTimer.WaitHeartBeat()
+		// if timeout and not granting vote to candidate
+		// (if follower receives no communication over a period of time)
+		rf.mu.Lock()
+		if (! rf.raftTimer.HasReceivedHeartBeat()) && (rf.votedFor == -1 && rf.role == Follower){
+			log.Printf("%d wants to timeout\n", rf.me)
+			defer rf.ChangeToCandidate() 
+			rf.mu.Unlock()
+			break
+		}
+		// will not start an election on either or both
+		// 1. receive heartbeat 
+		// 2. has granted vote for someone.
+		// Reset the timer.
+		log.Printf("%d with role:%d heartbeat:%d votedfor %d\n", rf.me, rf.role, rf.raftTimer.HasReceivedHeartBeat(), rf.votedFor)
+		
+		rf.raftTimer.SetHeartBeatTo(false)
+		rf.votedFor = -1
+		rf.mu.Unlock()
+		rf.raftTimer.SleepFor(1)
+	}
+	log.Printf("%d outside follower timeout\n", rf.me)
+}
+
+func (rf *Raft) ChangeToCandidate() {
+
+	if rf.role == Candidate || rf.role == Leader{
+		return
+	}
+	rf.ChangeRoleTo(Candidate)
+	rf.votedFor = -1
+	rf.voteCounts = 0
+	rf.raftTimer.SetHeartBeatTo(false)
+
+	go rf.StartElection()
+}
+
+func (rf *Raft) StartElection() {
+	// While there is no leader, keep waiting for election
+	for rf.role == Candidate && rf.voteCounts < len(rf.peers)/2 + 1 {
+		rf.mu.Lock()
+		// log.Printf("%d start election with term %d\n", rf.me, rf.currentTerm)
+		rf.currentTerm += 1
+		rf.voteCounts = 1
+		rf.votedFor = rf.me
+		_, lastIndex := GetLastLogEntryAndIndex(rf.logs)
+		LastLogTerm := "WHO?"
+		args :=  RequestVoteArgs{
+			Term: rf.currentTerm,
+			CandidateId: rf.me,
+			LastLogIndex: lastIndex,
+			LastLogTerm: LastLogTerm,
+		}
+
+		reply := RequestVoteReply {
+			Term : -1,
+			VoteGranted : false,
+		}
+		rf.mu.Unlock()
+		for i := 0; i < len(rf.peers) && rf.role == Candidate; i ++ {
+			if i != rf.me {
+				// should be multi-thread or it will be blocked?
+				go rf.SendRequestVote(i, &args, &reply)
+			}
+		}
+		// Wait for any response or someone with higher amount of 
+		randTimeOutInMillSec := rf.electionTimeoutMillSec + rand.Intn(50)
+
+		time.Sleep(time.Duration(randTimeOutInMillSec))
+		rf.mu.Lock()
+		if rf.voteCounts >= (len(rf.peers)/2 + 1) {
+			break
+		} else if rf.raftTimer.HasReceivedHeartBeat() {
+			break
+		}
+		rf.mu.Unlock()
+	}
+	
+	if rf.raftTimer.HasReceivedHeartBeat() {
+		defer rf.ChangeToFollower()
+		rf.mu.Unlock()
+
+	} else if rf.voteCounts >= (len(rf.peers))/2 + 1 {
+		defer rf.ChangeToLeader() // Change to leader only when no heart beat and recevie from majority.
+		rf.mu.Unlock()
+	}
+}
+
+func (rf *Raft) startHeartBeat(){
+	log.Printf("%d Broadcast heartbeat with term: %d\n", rf.me, rf.currentTerm)
+	for rf.role == Leader {
+		for i  := 0; i < len(rf.peers); i ++ {
+			if i != rf.me {
+				args := HeartBeatArgs{}
+				args.Term = rf.currentTerm
+				res := HeartBeatRes{}
+				go rf.sendHeartBeat(i, &args, &res)
+			}
+		}
+	}
+	log.Printf("%d is now %d instead of a leader\n", rf.me, rf.role)
+}
+
+func (rf *Raft) ChangeToLeader() {	
+
+	if rf.role == Leader || rf.role == Follower{
+		return
+	}
+	rf.ChangeRoleTo(Leader)
+	rf.raftTimer.SetHeartBeatTo(false)
+	go rf.startHeartBeat()
+}
+
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -234,7 +363,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-
+	rf.role = NotAssigned
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.raftTimer = NewRaftTime(300,200,500) // follower should receive heart beat within 80 millsec
+	rf.electionTimeoutMillSec = 100
+	rf.ChangeToFollower()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
