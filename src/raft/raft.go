@@ -20,12 +20,10 @@ package raft
 import "sync"
 import "sync/atomic"
 import "../labrpc"
-
+import "fmt"
 import "log"
 import "math/rand"
 import "time"
-// import "bytes"
-// import "../labgob"
 
 
 // Role of raft instance
@@ -70,18 +68,18 @@ type Raft struct {
 	logs []LogEntry // log entries, each entry contains command and term when it was received.
 	raftTimer *RaftTime
 
-	// volatile state on all servers.
+	// volatile state on all servers. (i.e. State should be consistence and kept using RPCs)
 	commitIndex int // index of highest log entry
 	lastApplied int // index of highest log entry applied to state machine.
 
 	// volatile state on leaders.
-
+	nextIndex []int // Index of highest log entry known to be committed
+	matchIndex []int // index of highest log entry known to be replicated on server
 
 	// Variables for leader election.
 	// vote counts.
 	voteCounts int
 	electionTimeoutMillSec int
-
 
 }
 
@@ -102,7 +100,6 @@ func (rf *Raft) GetState() (int, bool) {
 }
 
 func (rf *Raft) ChangeRoleTo(role int) {
-	log.Printf("%d %d -> %d with term %d", rf.me, rf.role, role, rf.currentTerm)
 	rf.role = role
 }
 
@@ -130,7 +127,6 @@ func (rf *Raft) persist() {
 	// rf.persister.SaveRaftState(data)
 }
 
-
 //
 // restore previously persisted state.
 //
@@ -154,17 +150,6 @@ func (rf *Raft) readPersist(data []byte) {
 }
 
 
-
-type HeartBeatArgs struct {
-	Term int // term of the Leader
-}
-
-type HeartBeatRes struct {
-	Term int // term from the response
-	Success bool
-}
-
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -180,14 +165,42 @@ type HeartBeatRes struct {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	index := rf.commitIndex
 	term := rf.currentTerm
 	isLeader := rf.role == Leader
 
 	// Your code here (2B).
+	if isLeader {
+		rf.StartAgreementOn(command)
+	}
 
 
 	return index, term, isLeader
+}
+
+func (rf *Raft) StartAgreementOn(command interface{}) {
+	newLogEntry := & LogEntry{
+			Term: command,
+			TermReceived: rf.currentTerm,
+			}
+	rf.logs = append(rf.logs, *newLogEntry)
+	
+	for i := 0; i < len(rf.peers) ; i ++ {
+		if i != rf.me {
+			go rf.StartAgreementWithPeer(i, len(rf.logs) - 1)
+		}
+	}
+
+	N := rf.GetNextCommitIndex()
+	for N == -1 {
+		rf.raftTimer.SleepFor(100)
+		fmt.Println(N)
+		N = rf.GetNextCommitIndex()
+	}
+	
+	rf.commitIndex = N
 }
 
 //
@@ -228,14 +241,9 @@ func (rf *Raft) ChangeToFollower() {
 func (rf *Raft) FollowerWaitTimeOut() {
 	rf.raftTimer.SetHeartBeatTo(false) // initialize.
 	for rf.role == Follower{
-		// sleep
-		log.Printf("%d sleep for heartbeat \n", rf.me)
 		rf.raftTimer.WaitHeartBeat()
-		// if timeout and not granting vote to candidate
-		// (if follower receives no communication over a period of time)
 		rf.mu.Lock()
 		if (! rf.raftTimer.HasReceivedHeartBeat()) && (rf.votedFor == -1 && rf.role == Follower){
-			log.Printf("%d wants to timeout\n", rf.me)
 			defer rf.ChangeToCandidate() 
 			rf.mu.Unlock()
 			break
@@ -244,14 +252,12 @@ func (rf *Raft) FollowerWaitTimeOut() {
 		// 1. receive heartbeat 
 		// 2. has granted vote for someone.
 		// Reset the timer.
-		log.Printf("%d with role:%d heartbeat:%d votedfor %d\n", rf.me, rf.role, rf.raftTimer.HasReceivedHeartBeat(), rf.votedFor)
 		
 		rf.raftTimer.SetHeartBeatTo(false)
 		rf.votedFor = -1
 		rf.mu.Unlock()
 		rf.raftTimer.SleepFor(1)
 	}
-	log.Printf("%d outside follower timeout\n", rf.me)
 }
 
 func (rf *Raft) ChangeToCandidate() {
@@ -277,7 +283,7 @@ func (rf *Raft) StartElection() {
 		rf.votedFor = rf.me
 		_, lastIndex := GetLastLogEntryAndIndex(rf.logs)
 		LastLogTerm := "WHO?"
-		args :=  RequestVoteArgs{
+		args :=  RequestVoteRequest{
 			Term: rf.currentTerm,
 			CandidateId: rf.me,
 			LastLogIndex: lastIndex,
@@ -319,18 +325,17 @@ func (rf *Raft) StartElection() {
 }
 
 func (rf *Raft) startHeartBeat(){
-	log.Printf("%d Broadcast heartbeat with term: %d\n", rf.me, rf.currentTerm)
 	for rf.role == Leader {
 		for i  := 0; i < len(rf.peers); i ++ {
 			if i != rf.me {
-				args := HeartBeatArgs{}
+				args := &AppendEntriesRequest{}
 				args.Term = rf.currentTerm
-				res := HeartBeatRes{}
-				go rf.sendHeartBeat(i, &args, &res)
+				args.LeaderId = rf.me
+				res := &AppendEntriesReply{}
+				go rf.sendHeartBeat(i, args, res)
 			}
 		}
 	}
-	log.Printf("%d is now %d instead of a leader\n", rf.me, rf.role)
 }
 
 func (rf *Raft) ChangeToLeader() {	
@@ -340,9 +345,12 @@ func (rf *Raft) ChangeToLeader() {
 	}
 	rf.ChangeRoleTo(Leader)
 	rf.raftTimer.SetHeartBeatTo(false)
+
+
+	SetAllValueInArrayTo(rf.nextIndex , GetLastIndex(rf.logs) + 1)
+    SetAllValueInArrayTo(rf.matchIndex, 0)
 	go rf.startHeartBeat()
 }
-
 
 //
 // the service or tester wants to create a Raft server. the ports
@@ -366,8 +374,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.role = NotAssigned
 	rf.currentTerm = 0
 	rf.votedFor = -1
+	rf.logs = make([]LogEntry, 0)
 	rf.raftTimer = NewRaftTime(300,200,500) // follower should receive heart beat within 80 millsec
+	rf.voteCounts = 0
 	rf.electionTimeoutMillSec = 100
+
+	rf.commitIndex = -1
+	rf.lastApplied = 0
+
+	rf.nextIndex = make([]int, len(peers))
+	rf.matchIndex = make([]int, len(peers))
+
 	rf.ChangeToFollower()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
